@@ -61,8 +61,4 @@ def analyze():
         "dcf_value": round(value / 1e9, 2),  # billions
         "risk_score": risk_score
     })
-
-@app.route("/")
-def home():
-    return "DCF Backend is running. Use /analyze?ticker=AAPL"
-
+    
