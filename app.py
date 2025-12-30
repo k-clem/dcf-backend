@@ -8,10 +8,6 @@ CORS(app)
 
 API_KEY = os.getenv("FMP_API_KEY")
 
-@app.route("/")
-def home():
-    return jsonify({"status": "DCF backend running"})
-
 @app.route("/analyze")
 def analyze():
     ticker = request.args.get("ticker")
@@ -26,10 +22,21 @@ def analyze():
     response = requests.get(cf_url)
     data = response.json()
 
-    if not data or "freeCashFlow" not in data[0]:
-        return jsonify({"error": "No cash flow data"}), 404
+    # ✅ SAFE VALIDATION
+    if not isinstance(data, list) or len(data) == 0:
+        return jsonify({
+            "error": "Invalid or empty cash flow response",
+            "raw_response": data
+        }), 404
 
-    fcf = [year["freeCashFlow"] for year in data if year.get("freeCashFlow")]
+    fcf = [
+        year.get("freeCashFlow")
+        for year in data
+        if year.get("freeCashFlow") is not None
+    ]
+
+    if len(fcf) < 2:
+        return jsonify({"error": "Not enough cash flow data"}), 404
 
     discount_rate = 0.10
     terminal_growth = 0.025
@@ -49,8 +56,10 @@ def analyze():
     return jsonify({
         "ticker": ticker.upper(),
         "dcf_value_billion": round(value / 1e9, 2),
-        "risk_score": risk_score
+        "risk_score": risk_score,
+        "years_used": len(fcf)
     })
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
