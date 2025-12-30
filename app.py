@@ -19,44 +19,49 @@ def true_dcf(fcf, growth=0.05, discount=0.1, terminal=0.02, years=10):
 def ai_risk(volatility, valuation_gap, drawdown):
     score = volatility * 40 + valuation_gap * 30 + drawdown * 30
     return min(100, round(score))
+import os
+import requests
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+API_KEY = os.getenv("FMP_API_KEY")
 
 @app.route("/analyze")
 def analyze():
     ticker = request.args.get("ticker")
     if not ticker:
-        return jsonify({"error": "Missing ticker"}), 400
+        return jsonify({"error": "Ticker required"}), 400
 
-    stock = yf.Ticker(ticker)
+    # Fetch cash flow
+    cf_url = f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{ticker}?limit=5&apikey={API_KEY}"
+    r = requests.get(cf_url).json()
 
-    cashflow = stock.cashflow
-    if cashflow is None or cashflow.empty:
-        return jsonify({"error": "No cash flow data"}), 400
+    if not r or "freeCashFlow" not in r[0]:
+        return jsonify({"error": "No cash flow data"}), 404
 
-    operating_cf = cashflow.loc["Total Cash From Operating Activities"][0]
-    capex = abs(cashflow.loc["Capital Expenditures"][0])
-    free_cash_flow = operating_cf - capex
+    fcf = [year["freeCashFlow"] for year in r if year["freeCashFlow"]]
 
-    price_data = stock.history(period="6mo")
-    returns = price_data["Close"].pct_change().dropna()
+    # DCF assumptions
+    discount_rate = 0.10
+    terminal_growth = 0.025
 
-    volatility = returns.std() * np.sqrt(252)
-    price = price_data["Close"].iloc[-1]
-    peak = price_data["Close"].max()
-    drawdown = (peak - price) / peak
+    value = 0
+    for i, cash in enumerate(fcf):
+        value += cash / ((1 + discount_rate) ** (i + 1))
 
-    dcf_value = true_dcf(free_cash_flow)
-    valuation_gap = abs(dcf_value - price) / price
-    risk = ai_risk(volatility, valuation_gap, drawdown)
+    terminal_value = fcf[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
+    value += terminal_value / ((1 + discount_rate) ** len(fcf))
+
+    # Simple AI-style risk score
+    volatility = max(fcf) - min(fcf)
+    risk_score = min(100, int((volatility / abs(sum(fcf))) * 100))
 
     return jsonify({
-        "ticker": ticker.upper(),
-        "price": round(price, 2),
-        "dcf": round(dcf_value, 2),
-        "risk": risk
+        "ticker": ticker,
+        "dcf_value": round(value / 1e9, 2),  # billions
+        "risk_score": risk_score
     })
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
 @app.route("/")
 def home():
     return "DCF Backend is running. Use /analyze?ticker=AAPL"
