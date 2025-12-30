@@ -14,51 +14,49 @@ def analyze():
     if not ticker:
         return jsonify({"error": "Ticker required"}), 400
 
-    cf_url = (
-        f"https://financialmodelingprep.com/api/v3/cash-flow-statement/"
-        f"{ticker}?limit=5&apikey={API_KEY}"
-    )
+    stock = yf.Ticker(ticker)
 
-    response = requests.get(cf_url)
-    data = response.json()
+    try:
+        cashflow = stock.cashflow
+        if cashflow is None or cashflow.empty:
+            return jsonify({"error": "No cash flow data available"}), 404
 
-    # ✅ SAFE VALIDATION
-    if not isinstance(data, list) or len(data) == 0:
+        # Free Cash Flow = Operating Cash Flow - CapEx
+        fcf_series = (
+            cashflow.loc["Total Cash From Operating Activities"]
+            - cashflow.loc["Capital Expenditures"]
+        )
+
+        fcf = fcf_series.dropna().values.tolist()
+
+        if len(fcf) < 2:
+            return jsonify({"error": "Insufficient FCF history"}), 404
+
+        discount_rate = 0.10
+        terminal_growth = 0.025
+
+        value = 0
+        for i, cash in enumerate(fcf):
+            value += cash / ((1 + discount_rate) ** (i + 1))
+
+        terminal_value = (
+            fcf[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
+        )
+        value += terminal_value / ((1 + discount_rate) ** len(fcf))
+
+        volatility = max(fcf) - min(fcf)
+        risk_score = min(100, int((volatility / abs(sum(fcf))) * 100))
+
         return jsonify({
-            "error": "Invalid or empty cash flow response",
-            "raw_response": data
-        }), 404
+            "ticker": ticker.upper(),
+            "dcf_value_billion": round(value / 1e9, 2),
+            "risk_score": risk_score,
+            "years_used": len(fcf)
+        })
 
-    fcf = [
-        year.get("freeCashFlow")
-        for year in data
-        if year.get("freeCashFlow") is not None
-    ]
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    if len(fcf) < 2:
-        return jsonify({"error": "Not enough cash flow data"}), 404
-
-    discount_rate = 0.10
-    terminal_growth = 0.025
-
-    value = 0
-    for i, cash in enumerate(fcf):
-        value += cash / ((1 + discount_rate) ** (i + 1))
-
-    terminal_value = (
-        fcf[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
-    )
-    value += terminal_value / ((1 + discount_rate) ** len(fcf))
-
-    volatility = max(fcf) - min(fcf)
-    risk_score = min(100, int((volatility / abs(sum(fcf))) * 100))
-
-    return jsonify({
-        "ticker": ticker.upper(),
-        "dcf_value_billion": round(value / 1e9, 2),
-        "risk_score": risk_score,
-        "years_used": len(fcf)
-    })
 
 
 if __name__ == "__main__":
