@@ -1,12 +1,11 @@
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests
+import yfinance as yf
+import numpy as np
 import os
 
 app = Flask(__name__)
 CORS(app)
-
-API_KEY = os.getenv("FMP_API_KEY")
 
 @app.route("/analyze")
 def analyze():
@@ -14,14 +13,20 @@ def analyze():
     if not ticker:
         return jsonify({"error": "Ticker required"}), 400
 
-    stock = yf.Ticker(ticker)
-
     try:
+        stock = yf.Ticker(ticker)
         cashflow = stock.cashflow
+
         if cashflow is None or cashflow.empty:
             return jsonify({"error": "No cash flow data available"}), 404
 
         # Free Cash Flow = Operating Cash Flow - CapEx
+        if (
+            "Total Cash From Operating Activities" not in cashflow.index
+            or "Capital Expenditures" not in cashflow.index
+        ):
+            return jsonify({"error": "FCF fields missing"}), 404
+
         fcf_series = (
             cashflow.loc["Total Cash From Operating Activities"]
             - cashflow.loc["Capital Expenditures"]
@@ -56,7 +61,6 @@ def analyze():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 
 if __name__ == "__main__":
