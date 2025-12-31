@@ -7,28 +7,24 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# --------------------
-# Lightweight cache
-# --------------------
 CACHE = {}
-CACHE_TTL = 60 * 15  # 15 minutes
+CACHE_TTL = 60 * 20  # 20 minutes
 
 
 @app.route("/")
 def home():
-    return "DCF backend running", 200
+    return "DCF-lite backend running", 200
 
 
 @app.route("/analyze")
 def analyze():
     ticker = request.args.get("ticker")
-
     if not ticker:
         return jsonify({"error": "Ticker required"}), 400
 
     ticker = ticker.upper()
 
-    # ---- CACHE CHECK ----
+    # ---- CACHE ----
     if ticker in CACHE:
         cached = CACHE[ticker]
         if time.time() - cached["time"] < CACHE_TTL:
@@ -38,60 +34,56 @@ def analyze():
 
     try:
         stock = yf.Ticker(ticker)
+        info = stock.info
 
-        # ---- FREE CASH FLOW (LIGHT CALL) ----
-        cashflow = stock.cashflow
-        if cashflow is None or cashflow.empty:
-            return jsonify({"error": "No cash flow data"}), 404
+        price = info.get("currentPrice")
+        eps = info.get("trailingEps")
+        shares = info.get("sharesOutstanding")
 
-        if "Free Cash Flow" not in cashflow.index:
-            return jsonify({"error": "FCF missing"}), 404
+        if not price or not eps or not shares:
+            return jsonify({"error": "Insufficient market data"}), 404
 
-        fcf_series = cashflow.loc["Free Cash Flow"].dropna()
-        fcf = list(reversed(fcf_series.values))[:4]
-
-        if len(fcf) < 2:
-            return jsonify({"error": "Insufficient cash flow history"}), 400
-
-        # ---- DCF ----
-        discount_rate = 0.10
-        terminal_growth = 0.025
+        # ---- FCF PROXY ----
+        payout_ratio = 0.6  # conservative
+        fcf_per_share = eps * payout_ratio
+        growth = 0.05
+        discount = 0.10
+        terminal = 0.025
+        years = 5
 
         value = 0
-        for i, cash in enumerate(fcf):
-            value += cash / ((1 + discount_rate) ** (i + 1))
+        fcf = fcf_per_share
 
-        terminal_value = fcf[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
-        value += terminal_value / ((1 + discount_rate) ** len(fcf))
+        for i in range(1, years + 1):
+            fcf *= (1 + growth)
+            value += fcf / ((1 + discount) ** i)
 
-        # ---- PRICE DATA (MINIMAL INFO ACCESS) ----
-        shares = stock.info.get("sharesOutstanding")
-        price = stock.info.get("currentPrice")
+        terminal_value = (fcf * (1 + terminal)) / (discount - terminal)
+        value += terminal_value / ((1 + discount) ** years)
 
-        if not shares or not price:
-            return jsonify({"error": "Price data unavailable"}), 500
+        intrinsic_price = round(value, 2)
 
-        intrinsic_price = value / shares
-
-        # ---- VALUATION SIGNAL ----
-        if intrinsic_price > price * 1.1:
+        # ---- VALUATION ----
+        if intrinsic_price > price * 1.15:
             signal = "Undervalued"
-        elif intrinsic_price < price * 0.9:
+        elif intrinsic_price < price * 0.85:
             signal = "Overvalued"
         else:
             signal = "Fairly Valued"
 
         # ---- RISK SCORE ----
-        volatility = (max(fcf) - min(fcf)) / abs(sum(fcf))
-        risk_score = min(100, round(volatility * 100))
+        beta = info.get("beta", 1)
+        pe = info.get("trailingPE", 20)
+
+        risk_score = min(100, int(beta * 30 + pe * 1.5))
 
         response = {
             "ticker": ticker,
-            "intrinsic_price": round(intrinsic_price, 2),
+            "intrinsic_price": intrinsic_price,
             "current_price": round(price, 2),
             "valuation_signal": signal,
             "risk_score": risk_score,
-            "years_used": len(fcf),
+            "years_used": years,
             "status": "complete"
         }
 
@@ -104,10 +96,10 @@ def analyze():
 
     except Exception as e:
         return jsonify({
-            "status": "rate_limited",
-            "error": "Upstream data unavailable",
+            "status": "error",
+            "error": "Market data unavailable",
             "details": str(e)
-        }), 429
+        }), 500
 
 
 if __name__ == "__main__":
