@@ -8,14 +8,14 @@ app = Flask(__name__)
 CORS(app)
 
 # --------------------
-# Simple in-memory cache
+# Lightweight cache
 # --------------------
 CACHE = {}
-CACHE_TTL = 60 * 10  # 10 minutes
+CACHE_TTL = 60 * 15  # 15 minutes
 
 
 @app.route("/")
-def health():
+def home():
     return "DCF backend running", 200
 
 
@@ -29,22 +29,23 @@ def analyze():
     ticker = ticker.upper()
 
     # ---- CACHE CHECK ----
-    cached = CACHE.get(ticker)
-    if cached and time.time() - cached["timestamp"] < CACHE_TTL:
-        cached_data = cached["data"]
-        cached_data["status"] = "cached"
-        return jsonify(cached_data)
+    if ticker in CACHE:
+        cached = CACHE[ticker]
+        if time.time() - cached["time"] < CACHE_TTL:
+            data = cached["data"]
+            data["status"] = "cached"
+            return jsonify(data)
 
     try:
         stock = yf.Ticker(ticker)
 
-        # ---- CASH FLOW ----
+        # ---- FREE CASH FLOW (LIGHT CALL) ----
         cashflow = stock.cashflow
         if cashflow is None or cashflow.empty:
-            return jsonify({"error": "No cash flow data available"}), 404
+            return jsonify({"error": "No cash flow data"}), 404
 
         if "Free Cash Flow" not in cashflow.index:
-            return jsonify({"error": "Free Cash Flow not found"}), 404
+            return jsonify({"error": "FCF missing"}), 404
 
         fcf_series = cashflow.loc["Free Cash Flow"].dropna()
         fcf = list(reversed(fcf_series.values))[:4]
@@ -52,7 +53,7 @@ def analyze():
         if len(fcf) < 2:
             return jsonify({"error": "Insufficient cash flow history"}), 400
 
-        # ---- DCF CALCULATION ----
+        # ---- DCF ----
         discount_rate = 0.10
         terminal_growth = 0.025
 
@@ -63,51 +64,48 @@ def analyze():
         terminal_value = fcf[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
         value += terminal_value / ((1 + discount_rate) ** len(fcf))
 
-        # ---- PRICING DATA ----
-        info = stock.info
-        shares_outstanding = info.get("sharesOutstanding")
-        current_price = info.get("currentPrice")
+        # ---- PRICE DATA (MINIMAL INFO ACCESS) ----
+        shares = stock.info.get("sharesOutstanding")
+        price = stock.info.get("currentPrice")
 
-        if not shares_outstanding or not current_price:
-            return jsonify({"error": "Missing pricing data"}), 500
+        if not shares or not price:
+            return jsonify({"error": "Price data unavailable"}), 500
 
-        intrinsic_price = value / shares_outstanding
+        intrinsic_price = value / shares
 
         # ---- VALUATION SIGNAL ----
-        if intrinsic_price > current_price * 1.1:
-            valuation_signal = "Undervalued"
-        elif intrinsic_price < current_price * 0.9:
-            valuation_signal = "Overvalued"
+        if intrinsic_price > price * 1.1:
+            signal = "Undervalued"
+        elif intrinsic_price < price * 0.9:
+            signal = "Overvalued"
         else:
-            valuation_signal = "Fairly Valued"
+            signal = "Fairly Valued"
 
-        # ---- AI RISK SCORE ----
+        # ---- RISK SCORE ----
         volatility = (max(fcf) - min(fcf)) / abs(sum(fcf))
         risk_score = min(100, round(volatility * 100))
 
-        response_data = {
+        response = {
             "ticker": ticker,
-            "dcf_value_billion": round(value / 1e9, 2),
             "intrinsic_price": round(intrinsic_price, 2),
-            "current_price": round(current_price, 2),
-            "valuation_signal": valuation_signal,
+            "current_price": round(price, 2),
+            "valuation_signal": signal,
             "risk_score": risk_score,
             "years_used": len(fcf),
             "status": "complete"
         }
 
-        # ---- CACHE STORE ----
         CACHE[ticker] = {
-            "timestamp": time.time(),
-            "data": response_data
+            "time": time.time(),
+            "data": response
         }
 
-        return jsonify(response_data)
+        return jsonify(response)
 
     except Exception as e:
         return jsonify({
             "status": "rate_limited",
-            "error": "Too many requests or upstream data unavailable",
+            "error": "Upstream data unavailable",
             "details": str(e)
         }), 429
 
