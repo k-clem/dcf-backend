@@ -15,84 +15,60 @@ def analyze():
 
     stock = yf.Ticker(ticker)
 
-    try:
-        cashflow = stock.cashflow
+    # --- Cash Flow ---
+    cashflow = stock.cashflow
+    if cashflow is None or cashflow.empty:
+        return jsonify({"error": "No cash flow data available"}), 404
 
-        # 🔁 FALLBACK: try quarterly if annual missing
-        if cashflow is None or cashflow.empty:
-            cashflow = stock.quarterly_cashflow
+    fcf_series = cashflow.loc["Free Cash Flow"].dropna()
+    fcf = list(reversed(fcf_series.values))[:4]  # last 4 years
 
-        if cashflow is None or cashflow.empty:
-            return jsonify({
-                "ticker": ticker.upper(),
-                "status": "queued",
-                "message": "Cash flow data temporarily unavailable, retry later"
-            }), 202
+    if len(fcf) < 2:
+        return jsonify({"error": "Insufficient cash flow history"}), 400
 
-        # Normalize possible Yahoo field names
-        op_fields = [
-            "Total Cash From Operating Activities",
-            "Operating Cash Flow"
-        ]
+    # --- DCF Calculation ---
+    discount_rate = 0.10
+    terminal_growth = 0.025
 
-        capex_fields = [
-            "Capital Expenditures",
-            "Capital Expenditure"
-        ]
+    value = 0
+    for i, cash in enumerate(fcf):
+        value += cash / ((1 + discount_rate) ** (i + 1))
 
-        ocf = None
-        capex = None
+    terminal_value = fcf[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
+    value += terminal_value / ((1 + discount_rate) ** len(fcf))
 
-        for f in op_fields:
-            if f in cashflow.index:
-                ocf = cashflow.loc[f]
-                break
+    # --- Pricing Data ---
+    info = stock.info
+    shares_outstanding = info.get("sharesOutstanding")
+    current_price = info.get("currentPrice")
 
-        for f in capex_fields:
-            if f in cashflow.index:
-                capex = cashflow.loc[f]
-                break
+    if not shares_outstanding or not current_price:
+        return jsonify({"error": "Missing pricing data"}), 500
 
-        if ocf is None or capex is None:
-            return jsonify({
-                "ticker": ticker.upper(),
-                "status": "queued",
-                "message": "Required cash flow fields missing"
-            }), 202
+    intrinsic_price = value / shares_outstanding
 
-        fcf = (ocf - capex).dropna().values.tolist()
+    # --- Valuation Signal ---
+    if intrinsic_price > current_price * 1.1:
+        valuation_signal = "Undervalued"
+    elif intrinsic_price < current_price * 0.9:
+        valuation_signal = "Overvalued"
+    else:
+        valuation_signal = "Fairly Valued"
 
-        if len(fcf) < 2:
-            return jsonify({
-                "ticker": ticker.upper(),
-                "status": "queued",
-                "message": "Insufficient historical cash flow"
-            }), 202
+    # --- AI Risk Score (simple but effective) ---
+    volatility = (max(fcf) - min(fcf)) / abs(sum(fcf))
+    risk_score = min(100, round(volatility * 100))
 
-        # DCF
-        discount_rate = 0.10
-        terminal_growth = 0.025
+    return jsonify({
+        "ticker": ticker.upper(),
+        "dcf_value_billion": round(value / 1e9, 2),
+        "intrinsic_price": round(intrinsic_price, 2),
+        "current_price": round(current_price, 2),
+        "valuation_signal": valuation_signal,
+        "risk_score": risk_score,
+        "years_used": len(fcf)
+    })
 
-        value = 0
-        for i, cash in enumerate(fcf):
-            value += cash / ((1 + discount_rate) ** (i + 1))
-
-        terminal_value = (
-            fcf[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
-        )
-        value += terminal_value / ((1 + discount_rate) ** len(fcf))
-
-        # AI Risk Score
-        volatility = np.std(fcf) / abs(np.mean(fcf))
-        risk_score = min(100, int(volatility * 100))
-
-        return jsonify({
-            "ticker": ticker.upper(),
-            "dcf_value_billion": round(value / 1e9, 2),
-            "risk_score": risk_score,
-            "years_used": len(fcf),
-            "status": "complete"
-        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
