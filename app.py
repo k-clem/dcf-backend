@@ -28,16 +28,22 @@ def get_shares(ticker):
 
 
 def get_free_cash_flow(ticker):
-    data = fetch(f"{BASE}/stock/financials-reported", {"symbol": ticker})
-    reports = data.get("data", [])
+    raw = fetch(f"{BASE}/stock/financials-reported", {"symbol": ticker})
+
+    # Finnhub sometimes returns dict, sometimes list
+    reports = raw.get("data") if isinstance(raw, dict) else raw
+    if not isinstance(reports, list):
+        return []
 
     fcf = []
-    for r in reports:
-        cf = r.get("report", {}).get("cf", {})
+    for item in reports:
+        report = item.get("report", {})
+        cf = report.get("cf", {})
+
         operating = cf.get("Net cash flow from operating activities")
         capex = cf.get("Capital expenditure")
 
-        if operating and capex:
+        if operating is not None and capex is not None:
             fcf.append(operating - abs(capex))
 
         if len(fcf) == 5:
