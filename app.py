@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import requests
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -13,16 +14,21 @@ if not API_KEY:
     raise RuntimeError("FINNHUB_API_KEY not set")
 
 
-def fetch(url, params):
+def fetch_json(url, params):
     params["token"] = API_KEY
     r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    return r.json()
+
+    if r.status_code != 200:
+        raise RuntimeError(f"Upstream HTTP {r.status_code}: {r.text}")
+
+    try:
+        return r.json()
+    except Exception:
+        raise RuntimeError("Upstream returned non-JSON response")
 
 
-def get_shares_outstanding(ticker):
-    # Try metrics first
-    metrics = fetch(f"{BASE}/stock/metric", {
+def get_shares(ticker):
+    metrics = fetch_json(f"{BASE}/stock/metric", {
         "symbol": ticker,
         "metric": "all"
     })
@@ -30,32 +36,32 @@ def get_shares_outstanding(ticker):
     if shares:
         return shares
 
-    # Fallback: company profile
-    profile = fetch(f"{BASE}/stock/profile2", {
+    time.sleep(0.3)
+
+    profile = fetch_json(f"{BASE}/stock/profile2", {
         "symbol": ticker
     })
     return profile.get("shareOutstanding")
 
 
-def calculate_dcf_per_share(fcf, shares):
+def dcf_per_share(fcf, shares):
     discount = 0.10
     terminal_growth = 0.025
 
-    value = 0
+    pv = 0
     for i, cash in enumerate(fcf):
-        value += cash / ((1 + discount) ** (i + 1))
+        pv += cash / ((1 + discount) ** (i + 1))
 
     terminal = (fcf[-1] * (1 + terminal_growth)) / (discount - terminal_growth)
-    value += terminal / ((1 + discount) ** len(fcf))
+    pv += terminal / ((1 + discount) ** len(fcf))
 
-    return value / shares
+    return pv / shares
 
 
 def risk_score(fcf):
     vol = max(fcf) - min(fcf)
     avg = sum(fcf) / len(fcf)
-    score = (vol / abs(avg)) * 100
-    return min(100, round(score))
+    return min(100, round((vol / abs(avg)) * 100))
 
 
 @app.route("/analyze")
@@ -65,11 +71,13 @@ def analyze():
         return jsonify({"error": "Ticker required"}), 400
 
     try:
-        shares = get_shares_outstanding(ticker)
+        shares = get_shares(ticker)
         if not shares:
             return jsonify({"error": "Shares outstanding unavailable"}), 400
 
-        cashflow = fetch(f"{BASE}/stock/cash-flow", {
+        time.sleep(0.3)
+
+        cashflow = fetch_json(f"{BASE}/stock/cash-flow", {
             "symbol": ticker
         })
 
@@ -83,10 +91,12 @@ def analyze():
         if len(fcf) < 3:
             return jsonify({"error": "Insufficient cash flow data"}), 400
 
-        quote = fetch(f"{BASE}/quote", {"symbol": ticker})
+        time.sleep(0.3)
+
+        quote = fetch_json(f"{BASE}/quote", {"symbol": ticker})
         price = quote.get("c")
 
-        intrinsic = calculate_dcf_per_share(fcf, shares)
+        intrinsic = dcf_per_share(fcf, shares)
         risk = risk_score(fcf)
 
         valuation = "Undervalued" if intrinsic > price else "Overvalued"
