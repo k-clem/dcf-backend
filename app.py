@@ -2,47 +2,59 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import requests
-import time
 
 app = Flask(__name__)
 CORS(app)
 
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+API_KEY = os.getenv("FINNHUB_API_KEY")
+BASE = "https://finnhub.io/api/v1"
 
-if not FINNHUB_API_KEY:
+if not API_KEY:
     raise RuntimeError("FINNHUB_API_KEY not set")
 
-BASE_URL = "https://finnhub.io/api/v1"
 
-
-def fetch_json(url, params):
-    params["token"] = FINNHUB_API_KEY
+def fetch(url, params):
+    params["token"] = API_KEY
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
     return r.json()
 
 
-def calculate_dcf_per_share(fcf_list, shares_outstanding):
-    discount_rate = 0.10
+def get_shares_outstanding(ticker):
+    # Try metrics first
+    metrics = fetch(f"{BASE}/stock/metric", {
+        "symbol": ticker,
+        "metric": "all"
+    })
+    shares = metrics.get("metric", {}).get("sharesOutstanding")
+    if shares:
+        return shares
+
+    # Fallback: company profile
+    profile = fetch(f"{BASE}/stock/profile2", {
+        "symbol": ticker
+    })
+    return profile.get("shareOutstanding")
+
+
+def calculate_dcf_per_share(fcf, shares):
+    discount = 0.10
     terminal_growth = 0.025
 
     value = 0
-    for i, fcf in enumerate(fcf_list):
-        value += fcf / ((1 + discount_rate) ** (i + 1))
+    for i, cash in enumerate(fcf):
+        value += cash / ((1 + discount) ** (i + 1))
 
-    terminal_value = (
-        fcf_list[-1] * (1 + terminal_growth)
-    ) / (discount_rate - terminal_growth)
+    terminal = (fcf[-1] * (1 + terminal_growth)) / (discount - terminal_growth)
+    value += terminal / ((1 + discount) ** len(fcf))
 
-    value += terminal_value / ((1 + discount_rate) ** len(fcf_list))
-
-    return value / shares_outstanding
+    return value / shares
 
 
-def risk_score_from_fcf(fcf_list):
-    volatility = max(fcf_list) - min(fcf_list)
-    avg = sum(fcf_list) / len(fcf_list)
-    score = (volatility / abs(avg)) * 100
+def risk_score(fcf):
+    vol = max(fcf) - min(fcf)
+    avg = sum(fcf) / len(fcf)
+    score = (vol / abs(avg)) * 100
     return min(100, round(score))
 
 
@@ -53,55 +65,39 @@ def analyze():
         return jsonify({"error": "Ticker required"}), 400
 
     try:
-        # Company metrics
-        metrics = fetch_json(
-            f"{BASE_URL}/stock/metric",
-            {"symbol": ticker, "metric": "all"}
-        )
-
-        shares = metrics.get("metric", {}).get("sharesOutstanding")
+        shares = get_shares_outstanding(ticker)
         if not shares:
             return jsonify({"error": "Shares outstanding unavailable"}), 400
 
-        # Cash flow
-        cashflow = fetch_json(
-            f"{BASE_URL}/stock/cash-flow",
-            {"symbol": ticker}
-        )
+        cashflow = fetch(f"{BASE}/stock/cash-flow", {
+            "symbol": ticker
+        })
 
         annual = cashflow.get("cashFlow", {}).get("annual", [])
-        fcf_list = [
-            year["freeCashFlow"]
-            for year in annual
-            if year.get("freeCashFlow") and year["freeCashFlow"] > 0
+        fcf = [
+            y["freeCashFlow"]
+            for y in annual
+            if y.get("freeCashFlow") and y["freeCashFlow"] > 0
         ][:5]
 
-        if len(fcf_list) < 3:
-            return jsonify({"error": "Insufficient cash flow history"}), 400
+        if len(fcf) < 3:
+            return jsonify({"error": "Insufficient cash flow data"}), 400
 
-        # Price
-        quote = fetch_json(
-            f"{BASE_URL}/quote",
-            {"symbol": ticker}
-        )
-        current_price = quote.get("c")
+        quote = fetch(f"{BASE}/quote", {"symbol": ticker})
+        price = quote.get("c")
 
-        intrinsic_value = calculate_dcf_per_share(fcf_list, shares)
-        risk = risk_score_from_fcf(fcf_list)
+        intrinsic = calculate_dcf_per_share(fcf, shares)
+        risk = risk_score(fcf)
 
-        valuation = (
-            "Undervalued"
-            if intrinsic_value > current_price
-            else "Overvalued"
-        )
+        valuation = "Undervalued" if intrinsic > price else "Overvalued"
 
         return jsonify({
             "ticker": ticker,
-            "price_per_share": round(current_price, 2),
-            "intrinsic_value_per_share": round(intrinsic_value, 2),
+            "price_per_share": round(price, 2),
+            "intrinsic_value_per_share": round(intrinsic, 2),
             "valuation_status": valuation,
             "risk_score": risk,
-            "years_used": len(fcf_list),
+            "years_used": len(fcf),
             "status": "complete"
         })
 
