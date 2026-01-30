@@ -22,28 +22,47 @@ def fetch(url, params):
     return r.json()
 
 
+def flatten(items):
+    for i in items:
+        if isinstance(i, list):
+            yield from flatten(i)
+        else:
+            yield i
+
+
 def get_shares(ticker):
     profile = fetch(f"{BASE}/stock/profile2", {"symbol": ticker})
-    return profile.get("shareOutstanding")
+    return profile.get("shareOutstanding") if isinstance(profile, dict) else None
 
 
 def get_free_cash_flow(ticker):
     raw = fetch(f"{BASE}/stock/financials-reported", {"symbol": ticker})
 
-    # Finnhub sometimes returns dict, sometimes list
-    reports = raw.get("data") if isinstance(raw, dict) else raw
-    if not isinstance(reports, list):
+    if isinstance(raw, dict):
+        data = raw.get("data", [])
+    elif isinstance(raw, list):
+        data = raw
+    else:
         return []
 
     fcf = []
-    for item in reports:
-        report = item.get("report", {})
-        cf = report.get("cf", {})
+
+    for item in flatten(data):
+        if not isinstance(item, dict):
+            continue
+
+        report = item.get("report")
+        if not isinstance(report, dict):
+            continue
+
+        cf = report.get("cf")
+        if not isinstance(cf, dict):
+            continue
 
         operating = cf.get("Net cash flow from operating activities")
         capex = cf.get("Capital expenditure")
 
-        if operating is not None and capex is not None:
+        if isinstance(operating, (int, float)) and isinstance(capex, (int, float)):
             fcf.append(operating - abs(capex))
 
         if len(fcf) == 5:
@@ -92,11 +111,12 @@ def analyze():
         time.sleep(0.4)
 
         quote = fetch(f"{BASE}/quote", {"symbol": ticker})
-        price = quote.get("c")
+        price = quote.get("c") if isinstance(quote, dict) else None
+        if not price:
+            return jsonify({"error": "Price unavailable"}), 400
 
         intrinsic = dcf_per_share(fcf, shares)
         risk = risk_score(fcf)
-
         valuation = "Undervalued" if intrinsic > price else "Overvalued"
 
         return jsonify({
