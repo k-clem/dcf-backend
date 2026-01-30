@@ -14,34 +14,36 @@ if not API_KEY:
     raise RuntimeError("FINNHUB_API_KEY not set")
 
 
-def fetch_json(url, params):
+def fetch(url, params):
     params["token"] = API_KEY
     r = requests.get(url, params=params, timeout=10)
-
     if r.status_code != 200:
-        raise RuntimeError(f"Upstream HTTP {r.status_code}: {r.text}")
-
-    try:
-        return r.json()
-    except Exception:
-        raise RuntimeError("Upstream returned non-JSON response")
+        raise RuntimeError(f"HTTP {r.status_code}")
+    return r.json()
 
 
 def get_shares(ticker):
-    metrics = fetch_json(f"{BASE}/stock/metric", {
-        "symbol": ticker,
-        "metric": "all"
-    })
-    shares = metrics.get("metric", {}).get("sharesOutstanding")
-    if shares:
-        return shares
-
-    time.sleep(0.3)
-
-    profile = fetch_json(f"{BASE}/stock/profile2", {
-        "symbol": ticker
-    })
+    profile = fetch(f"{BASE}/stock/profile2", {"symbol": ticker})
     return profile.get("shareOutstanding")
+
+
+def get_free_cash_flow(ticker):
+    data = fetch(f"{BASE}/stock/financials-reported", {"symbol": ticker})
+    reports = data.get("data", [])
+
+    fcf = []
+    for r in reports:
+        cf = r.get("report", {}).get("cf", {})
+        operating = cf.get("Net cash flow from operating activities")
+        capex = cf.get("Capital expenditure")
+
+        if operating and capex:
+            fcf.append(operating - abs(capex))
+
+        if len(fcf) == 5:
+            break
+
+    return fcf
 
 
 def dcf_per_share(fcf, shares):
@@ -75,25 +77,15 @@ def analyze():
         if not shares:
             return jsonify({"error": "Shares outstanding unavailable"}), 400
 
-        time.sleep(0.3)
+        time.sleep(0.4)
 
-        cashflow = fetch_json(f"{BASE}/stock/cash-flow", {
-            "symbol": ticker
-        })
-
-        annual = cashflow.get("cashFlow", {}).get("annual", [])
-        fcf = [
-            y["freeCashFlow"]
-            for y in annual
-            if y.get("freeCashFlow") and y["freeCashFlow"] > 0
-        ][:5]
-
+        fcf = get_free_cash_flow(ticker)
         if len(fcf) < 3:
             return jsonify({"error": "Insufficient cash flow data"}), 400
 
-        time.sleep(0.3)
+        time.sleep(0.4)
 
-        quote = fetch_json(f"{BASE}/quote", {"symbol": ticker})
+        quote = fetch(f"{BASE}/quote", {"symbol": ticker})
         price = quote.get("c")
 
         intrinsic = dcf_per_share(fcf, shares)
