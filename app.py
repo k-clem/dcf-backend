@@ -1,131 +1,51 @@
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-import os
-import requests
-import time
+import yfinance as yf
 
 app = Flask(__name__)
 CORS(app)
 
-API_KEY = os.getenv("FINNHUB_API_KEY")
-BASE = "https://finnhub.io/api/v1"
-
-if not API_KEY:
-    raise RuntimeError("FINNHUB_API_KEY not set")
-
-
-def fetch(url, params):
-    params["token"] = API_KEY
-    r = requests.get(url, params=params, timeout=10)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    return r.json()
-
-
-def flatten(items):
-    for i in items:
-        if isinstance(i, list):
-            yield from flatten(i)
-        else:
-            yield i
-
-
-def get_shares(ticker):
-    profile = fetch(f"{BASE}/stock/profile2", {"symbol": ticker})
-    return profile.get("shareOutstanding") if isinstance(profile, dict) else None
-
-
-def get_free_cash_flow(ticker):
-    raw = fetch(f"{BASE}/stock/financials-reported", {"symbol": ticker})
-
-    if isinstance(raw, dict):
-        data = raw.get("data", [])
-    elif isinstance(raw, list):
-        data = raw
-    else:
-        return []
-
-    fcf = []
-
-    for item in flatten(data):
-        if not isinstance(item, dict):
-            continue
-
-        report = item.get("report")
-        if not isinstance(report, dict):
-            continue
-
-        cf = report.get("cf")
-        if not isinstance(cf, dict):
-            continue
-
-        operating = cf.get("Net cash flow from operating activities")
-        capex = cf.get("Capital expenditure")
-
-        if isinstance(operating, (int, float)) and isinstance(capex, (int, float)):
-            fcf.append(operating - abs(capex))
-
-        if len(fcf) == 5:
-            break
-
-    return fcf
-
-
-def dcf_per_share(fcf, shares):
-    discount = 0.10
-    terminal_growth = 0.025
-
-    pv = 0
-    for i, cash in enumerate(fcf):
-        pv += cash / ((1 + discount) ** (i + 1))
-
-    terminal = (fcf[-1] * (1 + terminal_growth)) / (discount - terminal_growth)
-    pv += terminal / ((1 + discount) ** len(fcf))
-
-    return pv / shares
-
-
-def risk_score(fcf):
-    vol = max(fcf) - min(fcf)
-    avg = sum(fcf) / len(fcf)
-    return min(100, round((vol / abs(avg)) * 100))
-
-
 @app.route("/analyze")
 def analyze():
-    ticker = request.args.get("ticker", "").upper().strip()
-    if not ticker:
-        return jsonify({"error": "Ticker required"}), 400
-
     try:
-        shares = get_shares(ticker)
-        if not shares:
-            return jsonify({"error": "Shares outstanding unavailable"}), 400
+        ticker = request.args.get("ticker")
+        if not ticker:
+            return jsonify({"error": "Ticker required"}), 400
 
-        time.sleep(0.4)
+        stock = yf.Ticker(ticker)
+        info = stock.info
 
-        fcf = get_free_cash_flow(ticker)
-        if len(fcf) < 3:
-            return jsonify({"error": "Insufficient cash flow data"}), 400
+        price = info.get("currentPrice")
+        eps = info.get("trailingEps")
+        shares = info.get("sharesOutstanding")
 
-        time.sleep(0.4)
+        if not price or not eps or not shares:
+            return jsonify({"error": "Market data unavailable"}), 400
 
-        quote = fetch(f"{BASE}/quote", {"symbol": ticker})
-        price = quote.get("c") if isinstance(quote, dict) else None
-        if not price:
-            return jsonify({"error": "Price unavailable"}), 400
+        # --- Valuation assumptions ---
+        growth_rate = 0.08
+        discount_rate = 0.10
+        years = 5
+        terminal_multiple = 15
 
-        intrinsic = dcf_per_share(fcf, shares)
-        risk = risk_score(fcf)
-        valuation = "Undervalued" if intrinsic > price else "Overvalued"
+        # Project EPS
+        projected_eps = eps * ((1 + growth_rate) ** years)
+        fair_value = (projected_eps * terminal_multiple) / ((1 + discount_rate) ** years)
+
+        valuation_gap = (fair_value - price) / price
+
+        # Risk score (0 = low risk, 100 = high risk)
+        risk_score = min(100, max(1, int(abs(valuation_gap) * 100)))
+
+        verdict = "Undervalued" if fair_value > price else "Overvalued"
 
         return jsonify({
-            "ticker": ticker,
-            "price_per_share": round(price, 2),
-            "intrinsic_value_per_share": round(intrinsic, 2),
-            "valuation_status": valuation,
-            "risk_score": risk,
-            "years_used": len(fcf),
+            "ticker": ticker.upper(),
+            "price": round(price, 2),
+            "fair_value": round(fair_value, 2),
+            "valuation": verdict,
+            "risk_score": risk_score,
+            "years_used": years,
             "status": "complete"
         })
 
@@ -137,5 +57,6 @@ def analyze():
 
 
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
