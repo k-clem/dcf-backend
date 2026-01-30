@@ -1,103 +1,113 @@
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-import yfinance as yf
-import time
 import os
+import requests
+import time
 
 app = Flask(__name__)
 CORS(app)
 
-CACHE = {}
-CACHE_TTL = 60 * 20  # 20 minutes
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+
+if not FINNHUB_API_KEY:
+    raise RuntimeError("FINNHUB_API_KEY not set")
+
+BASE_URL = "https://finnhub.io/api/v1"
 
 
-@app.route("/")
-def home():
-    return "DCF-lite backend running", 200
+def fetch_json(url, params):
+    params["token"] = FINNHUB_API_KEY
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def calculate_dcf_per_share(fcf_list, shares_outstanding):
+    discount_rate = 0.10
+    terminal_growth = 0.025
+
+    value = 0
+    for i, fcf in enumerate(fcf_list):
+        value += fcf / ((1 + discount_rate) ** (i + 1))
+
+    terminal_value = (
+        fcf_list[-1] * (1 + terminal_growth)
+    ) / (discount_rate - terminal_growth)
+
+    value += terminal_value / ((1 + discount_rate) ** len(fcf_list))
+
+    return value / shares_outstanding
+
+
+def risk_score_from_fcf(fcf_list):
+    volatility = max(fcf_list) - min(fcf_list)
+    avg = sum(fcf_list) / len(fcf_list)
+    score = (volatility / abs(avg)) * 100
+    return min(100, round(score))
 
 
 @app.route("/analyze")
 def analyze():
-    ticker = request.args.get("ticker")
+    ticker = request.args.get("ticker", "").upper().strip()
     if not ticker:
         return jsonify({"error": "Ticker required"}), 400
 
-    ticker = ticker.upper()
-
-    # ---- CACHE ----
-    if ticker in CACHE:
-        cached = CACHE[ticker]
-        if time.time() - cached["time"] < CACHE_TTL:
-            data = cached["data"]
-            data["status"] = "cached"
-            return jsonify(data)
-
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        # Company metrics
+        metrics = fetch_json(
+            f"{BASE_URL}/stock/metric",
+            {"symbol": ticker, "metric": "all"}
+        )
 
-        price = info.get("currentPrice")
-        eps = info.get("trailingEps")
-        shares = info.get("sharesOutstanding")
+        shares = metrics.get("metric", {}).get("sharesOutstanding")
+        if not shares:
+            return jsonify({"error": "Shares outstanding unavailable"}), 400
 
-        if not price or not eps or not shares:
-            return jsonify({"error": "Insufficient market data"}), 404
+        # Cash flow
+        cashflow = fetch_json(
+            f"{BASE_URL}/stock/cash-flow",
+            {"symbol": ticker}
+        )
 
-        # ---- FCF PROXY ----
-        payout_ratio = 0.6  # conservative
-        fcf_per_share = eps * payout_ratio
-        growth = 0.05
-        discount = 0.10
-        terminal = 0.025
-        years = 5
+        annual = cashflow.get("cashFlow", {}).get("annual", [])
+        fcf_list = [
+            year["freeCashFlow"]
+            for year in annual
+            if year.get("freeCashFlow") and year["freeCashFlow"] > 0
+        ][:5]
 
-        value = 0
-        fcf = fcf_per_share
+        if len(fcf_list) < 3:
+            return jsonify({"error": "Insufficient cash flow history"}), 400
 
-        for i in range(1, years + 1):
-            fcf *= (1 + growth)
-            value += fcf / ((1 + discount) ** i)
+        # Price
+        quote = fetch_json(
+            f"{BASE_URL}/quote",
+            {"symbol": ticker}
+        )
+        current_price = quote.get("c")
 
-        terminal_value = (fcf * (1 + terminal)) / (discount - terminal)
-        value += terminal_value / ((1 + discount) ** years)
+        intrinsic_value = calculate_dcf_per_share(fcf_list, shares)
+        risk = risk_score_from_fcf(fcf_list)
 
-        intrinsic_price = round(value, 2)
+        valuation = (
+            "Undervalued"
+            if intrinsic_value > current_price
+            else "Overvalued"
+        )
 
-        # ---- VALUATION ----
-        if intrinsic_price > price * 1.15:
-            signal = "Undervalued"
-        elif intrinsic_price < price * 0.85:
-            signal = "Overvalued"
-        else:
-            signal = "Fairly Valued"
-
-        # ---- RISK SCORE ----
-        beta = info.get("beta", 1)
-        pe = info.get("trailingPE", 20)
-
-        risk_score = min(100, int(beta * 30 + pe * 1.5))
-
-        response = {
+        return jsonify({
             "ticker": ticker,
-            "intrinsic_price": intrinsic_price,
-            "current_price": round(price, 2),
-            "valuation_signal": signal,
-            "risk_score": risk_score,
-            "years_used": years,
+            "price_per_share": round(current_price, 2),
+            "intrinsic_value_per_share": round(intrinsic_value, 2),
+            "valuation_status": valuation,
+            "risk_score": risk,
+            "years_used": len(fcf_list),
             "status": "complete"
-        }
-
-        CACHE[ticker] = {
-            "time": time.time(),
-            "data": response
-        }
-
-        return jsonify(response)
+        })
 
     except Exception as e:
         return jsonify({
             "status": "error",
-            "error": "Market data unavailable",
             "details": str(e)
         }), 500
 
